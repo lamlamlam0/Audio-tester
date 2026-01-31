@@ -2,3 +2,6 @@ sounddevice>=0.4.7
 numpy
 scipy
 matplotlib
+pyqtgraph
+PyQt5
+# optional: aubio (for improved pitch detection) - see optional-requirements.txt

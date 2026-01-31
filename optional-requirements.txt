@@ -1,0 +1,2 @@
+# Optional, non-critical packages (may require system build tools on Windows)
+aubio
