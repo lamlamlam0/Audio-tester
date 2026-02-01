@@ -60,8 +60,21 @@ def _parabolic_interp(mags, idx):
     peak_db = m2 - 0.25 * (m1 - m3) * delta
     return float(idx) + float(delta), peak_db
 
+# Minimal helper to convert a frequency (Hz) to a piano-style note name like "A4"
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+def freq_to_note_name(freq):
+    """Convert frequency in Hz to nearest piano note name (e.g. A4). Returns None for invalid freq."""
+    if freq is None or freq <= 0 or np.isnan(freq):
+        return None
+    # MIDI note number (A4 = 440 Hz is MIDI 69)
+    midi = int(round(69 + 12 * np.log2(freq / 440.0)))
+    octave = midi // 12 - 1
+    name = NOTE_NAMES[midi % 12]
+    return f"{name}{octave}"
+
 class RealTimeSpectrum:
-    def __init__(self, fs=44100, window_size=4096, hop_size=512, min_freq=27.5, max_freq=4186.0, smooth=4, log_scale=True, min_amp=0.001, peak_count=6, peak_thresh=0.05, device=None, backend='auto'):
+    def __init__(self, fs=44100, window_size=4096, hop_size=512, min_freq=27.5, max_freq=4186.0, smooth=4, log_scale=True, min_amp=0.0001, peak_count=6, peak_thresh=0.05, device=None, backend='auto'):
         self.fs = int(fs)
         self.window_size = int(window_size)
         self.hop_size = int(hop_size)
@@ -73,6 +86,8 @@ class RealTimeSpectrum:
         self.peak_count = int(peak_count)
         self.peak_thresh = float(peak_thresh)
         self.device = device
+        # how many top notes to display (piano input expects small number)
+        self.note_display_count = 3
 
         # buffer & window (Hann window)
         self.buffer = np.zeros(self.window_size, dtype='float32')
@@ -136,6 +151,9 @@ class RealTimeSpectrum:
             self.peak_texts = [pg.TextItem(anchor=(0.5, 0)) for _ in range(self.peak_count)]
             for t in self.peak_texts:
                 self.spec_plot.addItem(t)
+            # small text box to show top N note names (updated each frame)
+            self.notes_text = pg.TextItem(anchor=(1, 0))
+            self.spec_plot.addItem(self.notes_text)
 
             # spectrogram (image)
             self.win.nextRow()
@@ -170,6 +188,9 @@ class RealTimeSpectrum:
             self.ax_spec.set_xlim(self.min_freq, self.max_freq)
             self.ax_spec.set_xlabel('Frequency (Hz)')
             self.ax_spec.set_ylabel('Amplitude')
+            # text box to show top notes
+            self.notes_text = self.ax_spec.text(0.98, 0.95, '', transform=self.ax_spec.transAxes,
+                                               ha='right', va='top', bbox=dict(facecolor='black', alpha=0.6, pad=4), color='gold')
 
             # spectrogram image
             img = np.zeros((self.mask.sum(), self.history_len))
@@ -293,16 +314,49 @@ class RealTimeSpectrum:
                     for f, m, txt in zip(freqs_sel, mags_sel, ann_texts):
                         a = self.ax_spec.text(f, m, txt, fontsize=8, ha='center', va='bottom', color='red')
                         self.peak_annots.append(a)
+
+                # Prepare top-N note display (take up to self.note_display_count from the top-ranked peaks)
+                notes_lines = []
+                for i, f in enumerate(freqs_sel[:self.note_display_count]):
+                    note = freq_to_note_name(f)
+                    notes_lines.append(f"{i+1}: {note if note is not None else '--'} ({f:.1f} Hz)")
+                notes_text = "\n".join(notes_lines) if notes_lines else '--'
+
+                if self.backend == 'pyqt':
+                    try:
+                        # set HTML with line breaks
+                        html = notes_text.replace('\n', '<br/>')
+                        self.notes_text.setHtml(f"<div style='color:#ffcc66;font-size:10pt'>{html}</div>")
+                        # position at top-right of plot
+                        try:
+                            self.notes_text.setPos(self.max_freq, maxv)
+                        except Exception:
+                            self.notes_text.setPos(self.max_freq, np.max(mags_smoothed) * 1.05)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.notes_text.set_text(notes_text)
+                    except Exception:
+                        pass
             else:
                 if self.backend == 'pyqt':
                     self.peaks_scatter.setData([])
                     for t in self.peak_texts:
                         t.setHtml("")
+                    try:
+                        self.notes_text.setHtml("")
+                    except Exception:
+                        pass
                 else:
                     self.peak_marker.set_data([], [])
                     for a in self.peak_annots:
                         a.remove()
                     self.peak_annots = []
+                    try:
+                        self.notes_text.set_text('--')
+                    except Exception:
+                        pass
         except Exception:
             # don't let peak annotation errors break the main loop
             pass
@@ -328,7 +382,7 @@ def main():
     p.add_argument('--minfreq', type=float, default=27.5, help='Minimum frequency to display (Hz). Default A0=27.5 Hz')
     p.add_argument('--maxfreq', type=float, default=4186.0, help='Maximum frequency to display (Hz). Default C8=4186 Hz')
     p.add_argument('--smooth', type=int, default=4, help='Temporal smoothing window (frames). Default 4')
-    p.add_argument('--minamp', type=float, default=0.001, help='Minimum amplitude displayed (linear). Default 0.001')
+    p.add_argument('--minamp', type=float, default=0.0001, help='Minimum amplitude displayed (linear). Default 0.0001')
     p.add_argument('--peakcount', type=int, default=6, help='Number of peaks to show (default 6)')
     p.add_argument('--peakthresh', type=float, default=0.05, help='Relative peak detection threshold (fraction of max). Default 0.05')
     p.add_argument('--no-log', action='store_true', help='Disable logarithmic frequency axis')
@@ -401,233 +455,7 @@ def analyze_and_reconstruct(x, fs, top_n=10, max_freq=None):
     }
 
 
-
-
-def _analyze_window_and_get_top(window, fs, top_n=10, max_freq=None):
-    # Keep backward-compatible helper for single-window analysis
-    N = len(window)
-    X = np.fft.rfft(window)
-    freqs = np.fft.rfftfreq(N, 1.0 / fs)
-
-    mags = np.abs(X) / N
-    if N > 1:
-        mags[1:-1] *= 2
-
-    if max_freq is not None:
-        mask = freqs <= max_freq
-        freqs_limited = freqs[mask]
-        mags_limited = mags[mask]
-        X_limited = X[mask]
-    else:
-        freqs_limited = freqs
-        mags_limited = mags
-        X_limited = X
-
-    idx = np.argsort(mags_limited)[-top_n:][::-1]
-    top_freqs = freqs_limited[idx]
-    top_mags = mags_limited[idx]
-    top_phases = np.angle(X_limited[idx])
-
-    order = np.argsort(top_freqs)
-    top_freqs = top_freqs[order]
-    top_mags = top_mags[order]
-    top_phases = top_phases[order]
-
-    t = np.arange(N) / fs
-    recon = np.zeros_like(t)
-    for A, f, phi in zip(top_mags, top_freqs, top_phases):
-        recon += A * np.cos(2 * np.pi * f * t + phi)
-
-    return {
-        'freqs': freqs,
-        'mags': mags,
-        'top_freqs': top_freqs,
-        'top_mags': top_mags,
-        'top_phases': top_phases,
-        'recon': recon,
-        't': t,
-    }
-
-
-# Try to import aubio and pyqtgraph for real-time transcription/plotting
-try:
-    import aubio
-    aubio_available = True
-except Exception:
-    aubio_available = False
-
-try:
-    import pyqtgraph as pg
-    from pyqtgraph.Qt import QtCore, QtGui
-    pyqt_available = True
-except Exception:
-    pyqt_available = False
-
-
-NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-def freq_to_note_name(freq):
-    if freq <= 0 or np.isnan(freq):
-        return None
-    # MIDI note number
-    midi = int(round(69 + 12 * np.log2(freq / 440.0)))
-    octave = midi // 12 - 1
-    name = NOTE_NAMES[midi % 12]
-    return f"{name}{octave}"
-
-
-class LiveTranscriber:
-    """Fast live plotting and simple transcription optimized for piano notes.
-
-    Notes:
-    - Uses pyqtgraph for fast plotting and aubio (if available) for pitch detection.
-    - This is mostly for monophonic or dominant-note detection; full polyphonic piano
-      transcription is much more complex and requires ML-based approaches.
-    """
-
-    def __init__(self, fs, window_size=4096, hop_size=1024, top_n=10, max_freq=8000.0):
-        if not pyqt_available:
-            raise RuntimeError('pyqtgraph (and PyQt5/PySide2) is required for live transcription')
-
-        self.fs = fs
-        self.window_size = window_size
-        self.hop_size = hop_size
-        self.top_n = top_n
-        self.max_freq = max_freq
-
-        self.buffer = np.zeros(window_size, dtype='float32')
-        self.window_func = np.hanning(window_size)
-        self.last_hop = np.zeros(hop_size, dtype='float32')
-
-        # aubio pitch detector (optional)
-        if aubio_available:
-            self.pitch_o = aubio.pitch('yinfft', window_size, hop_size, fs)
-            self.pitch_o.set_unit('Hz')
-            self.pitch_o.set_silence(-40)
-        else:
-            self.pitch_o = None
-
-        # Setup pyqtgraph window
-        self.app = pg.mkQApp('Live Transcription')
-        self.win = pg.GraphicsLayoutWidget(show=True, title='Live Piano Transcription')
-        self.win.resize(900, 600)
-
-        # Spectrum plot
-        self.spec_plot = self.win.addPlot(row=0, col=0, title='Amplitude spectrum')
-        freqs = np.fft.rfftfreq(self.window_size, 1.0 / fs)
-        if max_freq is not None:
-            mask = freqs <= max_freq
-            self.freqs_plot = freqs[mask]
-            self.spec_mask = mask
-        else:
-            self.freqs_plot = freqs
-            self.spec_mask = slice(None)
-        self.spec_curve = self.spec_plot.plot(self.freqs_plot, np.zeros_like(self.freqs_plot), pen='c')
-        self.spec_peaks_scatter = pg.ScatterPlotItem(size=8, brush='r')
-        self.spec_plot.addItem(self.spec_peaks_scatter)
-
-        # Time-domain plot
-        self.time_plot = self.win.addPlot(row=1, col=0, title='Time domain (window)')
-        t = np.arange(self.window_size) / fs
-        self.time_curve = self.time_plot.plot(t, np.zeros_like(t), pen='w')
-        self.recon_curve = self.time_plot.plot(t, np.zeros_like(t), pen='y')
-
-        # Note display
-        self.note_text = pg.TextItem(html='<div style="font-size:20pt">--</div>', anchor=(0, 0))
-        self.note_text.setPos(0, 1)
-        self.win.addItem(self.note_text, row=0, col=0)
-
-        # Timer to update plots at GUI-friendly rate
-        self.timer = QtCore.QTimer()
-        interval_ms = max(20, int(1000.0 * self.hop_size / self.fs))
-        self.timer.setInterval(interval_ms)
-        self.timer.timeout.connect(self.update)
-
-    def audio_callback(self, indata, frames, time, status):
-        if status:
-            print(status)
-        data = indata[:, 0]
-        # update circular buffer
-        self.buffer = np.roll(self.buffer, -frames)
-        self.buffer[-frames:] = data
-        # keep last hop for pitch detection
-        if frames >= self.hop_size:
-            self.last_hop = data[-self.hop_size:]
-        else:
-            # combine last part with previous
-            self.last_hop = np.roll(self.last_hop, -frames)
-            self.last_hop[-frames:] = data
-
-    def update(self):
-        # FFT
-        windowed = self.buffer * self.window_func
-        X = np.fft.rfft(windowed)
-        mags = np.abs(X) / len(windowed)
-        if len(mags) > 2:
-            mags[1:-1] *= 2
-
-        mags_plot = mags[self.spec_mask]
-        self.spec_curve.setData(self.freqs_plot, mags_plot)
-
-        # find peaks for simple polyphonic hints (not robust transcription)
-        try:
-            peaks, _ = find_peaks(mags_plot, height=np.max(mags_plot) * 0.1, distance=3)
-            if len(peaks):
-                peak_freqs = self.freqs_plot[peaks]
-                peak_mags = mags_plot[peaks]
-                spots = [{'pos': (f, m)} for f, m in zip(peak_freqs, peak_mags)]
-                self.spec_peaks_scatter.setData(spots)
-            else:
-                self.spec_peaks_scatter.setData([])
-        except Exception:
-            self.spec_peaks_scatter.setData([])
-
-        # simple reconstruction of top components
-        idx = np.argsort(mags)[-self.top_n:][::-1]
-        top_freqs = np.fft.rfftfreq(self.window_size, 1.0 / self.fs)[idx]
-        top_mags = mags[idx]
-        top_phases = np.angle(X[idx])
-        t = np.arange(self.window_size) / self.fs
-        recon = np.zeros_like(t)
-        for A, f, phi in zip(top_mags, top_freqs, top_phases):
-            recon += A * np.cos(2 * np.pi * f * t + phi)
-        self.time_curve.setData(t, self.buffer)
-        self.recon_curve.setData(t, recon)
-
-        # pitch detection (dominant) using aubio if present
-        note_str = '--'
-        if self.pitch_o is not None:
-            # aubio expects float32 array
-            buf = aubio.float_type(self.last_hop.tolist())
-            pitch = self.pitch_o(buf)[0]
-            confidence = self.pitch_o.get_confidence()
-            if pitch > 0 and confidence > 0.6:
-                note = freq_to_note_name(pitch)
-                note_str = f"{note} ({pitch:.1f} Hz, conf {confidence:.2f})"
-        else:
-            # fallback: use strongest peak
-            strongest_idx = np.argmax(mags)
-            strongest_freq = np.fft.rfftfreq(self.window_size, 1.0 / self.fs)[strongest_idx]
-            if strongest_freq > 0:
-                note = freq_to_note_name(strongest_freq)
-                note_str = f"{note} ({strongest_freq:.1f} Hz)"
-
-        self.note_text.setText(f"<div style=\"font-size:18pt\">{note_str}</div>")
-
-    def run(self, duration=None):
-        try:
-            with sd.InputStream(callback=self.audio_callback, channels=1, samplerate=self.fs, blocksize=self.hop_size):
-                self.timer.start()
-                if duration is None:
-                    print(f"Starting live transcription (press Ctrl-C to stop). Window {self.window_size}, hop {self.hop_size}")
-                    QtGui.QApplication.instance().exec_()
-                else:
-                    print(f"Starting live transcription for {duration} seconds")
-                    QtGui.QApplication.instance().processEvents()
-                    QtCore.QTimer.singleShot(int(duration * 1000), QtGui.QApplication.instance().quit)
-                    QtGui.QApplication.instance().exec_()
-        except KeyboardInterrupt:
-            print('Stopped by user')
-
-
+# Removed unused helpers and LiveTranscriber class to keep this module focused on the
+# realtime spectrum analyzer. If you need transcription helpers later, consider
+# moving them to a separate module.
 
